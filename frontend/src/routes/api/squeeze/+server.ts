@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { cachedFetch, binanceLimiter, rateLimitedFetch } from '$lib/server/apiCache';
+import { BINANCE_API_KEY } from '$env/static/private';
 
 const BINANCE_BASE = 'https://api.binance.com';
 
@@ -119,11 +120,13 @@ export const GET: RequestHandler = async ({ url }) => {
                 const results: any[] = [];
                 const symbols = await getTopSymbols();
 
-                // Fetch each symbol sequentially with rate limiting
-                for (const symbol of symbols) {
+                // Optimized: Process all symbols in parallel to avoid Vercel timeout
+                const tasks = symbols.map(async (symbol) => {
                     try {
                         const apiUrl = `${BINANCE_BASE}/api/v3/klines?symbol=${symbol}&interval=${tf}&limit=100`;
-                        const res = await rateLimitedFetch(apiUrl, binanceLimiter);
+                        const res = await rateLimitedFetch(apiUrl, binanceLimiter, {
+                            headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
+                        });
 
                         if (res.ok) {
                             const klines = await res.json();
@@ -131,24 +134,25 @@ export const GET: RequestHandler = async ({ url }) => {
                             const squeeze = calculateSqueeze(parsed);
 
                             if (squeeze.isSqueeze) {
-                                results.push({
+                                return {
                                     symbol: symbol.replace('USDT', '/USDT'),
                                     binanceSymbol: symbol,
                                     count: squeeze.count,
                                     price: squeeze.price,
                                     timeframe: tf,
-                                });
+                                };
                             }
                         }
                     } catch (e) {
                         console.error(`[squeeze] Error scanning ${symbol}:`, e);
                     }
+                    return null;
+                });
 
-                    // Small delay between requests
-                    await new Promise(r => setTimeout(r, 100));
-                }
+                const allResults = await Promise.all(tasks);
+                const filtered = allResults.filter(r => r !== null);
 
-                return results.sort((a, b) => b.count - a.count);
+                return filtered.sort((a, b) => b.count - a.count);
             }
         );
 

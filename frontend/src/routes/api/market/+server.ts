@@ -1,7 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { cachedFetch, coingeckoLimiter, binanceLimiter, rateLimitedFetch } from '$lib/server/apiCache';
-import { COINGECKO_API_KEY } from '$env/static/private';
+import { COINGECKO_API_KEY, BINANCE_API_KEY } from '$env/static/private';
 
 const CG_BASE = 'https://api.coingecko.com/api/v3';
 const BINANCE_BASE = 'https://api.binance.com/api/v3';
@@ -34,7 +34,9 @@ export const GET: RequestHandler = async ({ url }) => {
                 120_000, // 2 min TTL
                 async () => {
                     const apiUrl = `${BINANCE_BASE}/ticker/24hr`;
-                    const res = await rateLimitedFetch(apiUrl, binanceLimiter);
+                    const res = await rateLimitedFetch(apiUrl, binanceLimiter, {
+                        headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
+                    });
                     if (!res.ok) throw new Error(`Binance ticker error: ${res.status}`);
                     return await res.json();
                 }
