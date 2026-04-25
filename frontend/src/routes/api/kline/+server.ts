@@ -3,7 +3,12 @@ import type { RequestHandler } from './$types';
 import { binanceLimiter, cachedFetch, rateLimitedFetch } from '$lib/server/apiCache';
 import { BINANCE_API_KEY } from '$env/static/private';
 
-const BINANCE_BASE = 'https://api.binance.com';
+const BINANCE_BASES = [
+    'https://api.binance.com',
+    'https://api1.binance.com',
+    'https://api2.binance.com',
+    'https://api3.binance.com'
+];
 
 export const GET: RequestHandler = async ({ url }) => {
     const symbol = url.searchParams.get('symbol') || 'BTCUSDT';
@@ -15,20 +20,34 @@ export const GET: RequestHandler = async ({ url }) => {
             `kline:${symbol}:${interval}:${limit}`,
             60_000, // 1 min TTL
             async () => {
-                const apiUrl = `${BINANCE_BASE}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+                let lastError = null;
 
-                const res = await rateLimitedFetch(apiUrl, binanceLimiter, {
-                    headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
-                });
+                // Try different Binance bases and with/without key
+                for (const base of BINANCE_BASES) {
+                    const apiUrl = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
 
-                if (!res.ok) {
-                    throw new Error(`Binance API error: ${res.status} ${res.statusText}`);
+                    // Try with Key first
+                    try {
+                        const res = await rateLimitedFetch(apiUrl, binanceLimiter, {
+                            headers: BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {}
+                        });
+                        if (res.ok) return await res.json();
+                        
+                        // If 401/403, Key might be invalid or IP restricted, try without Key on next loop or same base
+                        if (res.status === 401 || res.status === 403) {
+                             const resNoKey = await rateLimitedFetch(apiUrl, binanceLimiter);
+                             if (resNoKey.ok) return await resNoKey.json();
+                        }
+                    } catch (e) {
+                        lastError = e;
+                    }
                 }
+                throw lastError || new Error('All Binance endpoints failed');
+            }
+        );
 
-                const rawData = await res.json();
-
-                // Format for Lightweight Charts: { time, open, high, low, close, volume }
-                return rawData.map((k: any[]) => ({
+        // Format for Lightweight Charts: { time, open, high, low, close, volume }
+        const formatted = (data as any[]).map((k: any[]) => ({
                     time: Math.floor(k[0] / 1000), // Convert ms to seconds (UNIX timestamp)
                     open: parseFloat(k[1]),
                     high: parseFloat(k[2]),
