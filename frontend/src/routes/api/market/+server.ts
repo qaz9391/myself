@@ -1,7 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { cachedFetch, coingeckoLimiter, binanceLimiter, rateLimitedFetch } from '$lib/server/apiCache';
-import { COINGECKO_API_KEY, BINANCE_API_KEY } from '$env/static/private';
+import { env } from '$env/dynamic/private';
 
 const CG_BASE = 'https://api.coingecko.com/api/v3';
 const BINANCE_BASE = 'https://api.binance.com/api/v3';
@@ -35,7 +35,7 @@ export const GET: RequestHandler = async ({ url }) => {
                 async () => {
                     const apiUrl = `${BINANCE_BASE}/ticker/24hr`;
                     const res = await rateLimitedFetch(apiUrl, binanceLimiter, {
-                        headers: { 'X-MBX-APIKEY': BINANCE_API_KEY }
+                        headers: env.BINANCE_API_KEY ? { 'X-MBX-APIKEY': env.BINANCE_API_KEY } : {}
                     });
                     if (!res.ok) throw new Error(`Binance ticker error: ${res.status}`);
                     return await res.json();
@@ -82,7 +82,7 @@ export const GET: RequestHandler = async ({ url }) => {
                 async () => {
                     const apiUrl = `${CG_BASE}/coins/markets?vs_currency=usd&order=volume_desc&per_page=50&page=1&sparkline=false&price_change_percentage=24h`;
                     const res = await rateLimitedFetch(apiUrl, coingeckoLimiter, {
-                        headers: { 'x-cg-demo-api-key': COINGECKO_API_KEY }
+                        headers: { 'x-cg-demo-api-key': env.COINGECKO_API_KEY || '' }
                     });
                     if (!res.ok) throw new Error(`CoinGecko error: ${res.status}`);
                     return await res.json();

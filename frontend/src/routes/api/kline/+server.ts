@@ -1,3 +1,6 @@
+import { json } from '@sveltejs/kit';
+import type { RequestHandler } from './$types';
+
 export const GET: RequestHandler = async ({ url }) => {
     const symbol = url.searchParams.get('symbol') || 'BTCUSDT';
     const interval = url.searchParams.get('interval') || '4h';

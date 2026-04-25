@@ -1,7 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { cachedFetch, cryptocompareLimiter, rateLimitedFetch } from '$lib/server/apiCache';
-import { CRYPTOCOMPARE_API_KEY } from '$env/static/private';
+import { env } from '$env/dynamic/private';
 
 const BASE_URL = 'https://min-api.cryptocompare.com/data/v2/news/';
 
@@ -20,7 +20,7 @@ export const GET: RequestHandler = async ({ url }) => {
                 }
 
                 const res = await rateLimitedFetch(apiUrl, cryptocompareLimiter, {
-                    headers: { 'authorization': `Apikey ${CRYPTOCOMPARE_API_KEY}` }
+                    headers: { 'authorization': `Apikey ${env.CRYPTOCOMPARE_API_KEY || ''}` }
                 });
 
                 if (!res.ok) {

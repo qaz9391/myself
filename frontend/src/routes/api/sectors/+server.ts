@@ -1,7 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { cachedFetch, coingeckoLimiter, rateLimitedFetch } from '$lib/server/apiCache';
-import { COINGECKO_API_KEY } from '$env/static/private';
+import { env } from '$env/dynamic/private';
 
 const BASE_URL = 'https://api.coingecko.com/api/v3';
 
@@ -16,7 +16,7 @@ export const GET: RequestHandler = async ({ url }) => {
                 const apiUrl = `${BASE_URL}/coins/categories?order=${order}`;
 
                 const res = await rateLimitedFetch(apiUrl, coingeckoLimiter, {
-                    headers: { 'x-cg-demo-api-key': COINGECKO_API_KEY }
+                    headers: { 'x-cg-demo-api-key': env.COINGECKO_API_KEY || '' }
                 });
 
                 if (!res.ok) {
