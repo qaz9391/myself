@@ -1,65 +1,20 @@
-import { json } from '@sveltejs/kit';
-import type { RequestHandler } from './$types';
-import { binanceLimiter, cachedFetch, rateLimitedFetch } from '$lib/server/apiCache';
-import { env } from '$env/dynamic/private';
-
-const BINANCE_BASES = [
-    'https://api.binance.com',
-    'https://api1.binance.com',
-    'https://api2.binance.com',
-    'https://api3.binance.com'
-];
-
 export const GET: RequestHandler = async ({ url }) => {
     const symbol = url.searchParams.get('symbol') || 'BTCUSDT';
     const interval = url.searchParams.get('interval') || '4h';
-    const limit = Math.min(parseInt(url.searchParams.get('limit') || '200'), 1000);
+    const limit = url.searchParams.get('limit') || '300';
 
     try {
-        const data = await cachedFetch(
-            `kline:${symbol}:${interval}:${limit}`,
-            60_000, // 1 min TTL
-            async () => {
-                let lastError = null;
-
-                // Try different Binance bases and with/without key
-                for (const base of BINANCE_BASES) {
-                    const apiUrl = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-
-                    const apiKey = env.BINANCE_API_KEY;
-                    // Try with Key first
-                    try {
-                        const res = await rateLimitedFetch(apiUrl, binanceLimiter, {
-                            headers: apiKey ? { 'X-MBX-APIKEY': apiKey } : {}
-                        });
-                        if (res.ok) return await res.json();
-                        
-                        // If 401/403, Key might be invalid or IP restricted, try without Key on next loop or same base
-                        if (res.status === 401 || res.status === 403) {
-                             const resNoKey = await rateLimitedFetch(apiUrl, binanceLimiter);
-                             if (resNoKey.ok) return await resNoKey.json();
-                        }
-                    } catch (e) {
-                        lastError = e;
-                    }
-                }
-                // If we reach here, all failed
-                const errorStatus = (lastError as any)?.response?.status || 500;
-                const errorText = (lastError as any)?.message || 'Unknown error';
-                return { _isError: true, status: errorStatus, message: errorText };
-            }
-        );
-
-        if ((data as any)._isError) {
-            return json({ error: (data as any).message, status: (data as any).status }, { status: 500 });
-        }
-        if (!Array.isArray(data)) {
-            console.error('[/api/kline] Data is not an array:', data);
-            return json([]);
+        const apiUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+        const res = await fetch(apiUrl);
+        
+        if (!res.ok) {
+            return json({ error: `Binance returned ${res.status}` }, { status: res.status });
         }
 
+        const data = await res.json();
+        
         const formatted = data.map((k: any[]) => ({
-            time: Math.floor(k[0] / 1000), // Convert ms to seconds (UNIX timestamp)
+            time: Math.floor(k[0] / 1000),
             open: parseFloat(k[1]),
             high: parseFloat(k[2]),
             low: parseFloat(k[3]),
@@ -69,7 +24,6 @@ export const GET: RequestHandler = async ({ url }) => {
 
         return json(formatted);
     } catch (err: any) {
-        console.error('[/api/kline] Error:', err.message);
         return json({ error: err.message }, { status: 500 });
     }
 };
