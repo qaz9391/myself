@@ -48,18 +48,21 @@ export const GET: RequestHandler = async ({ url }) => {
         );
 
         // Format for Lightweight Charts: { time, open, high, low, close, volume }
-        const formatted = (data as any[]).map((k: any[]) => ({
-                    time: Math.floor(k[0] / 1000), // Convert ms to seconds (UNIX timestamp)
-                    open: parseFloat(k[1]),
-                    high: parseFloat(k[2]),
-                    low: parseFloat(k[3]),
-                    close: parseFloat(k[4]),
-                    volume: parseFloat(k[5]),
-                }));
-            }
-        );
+        if (!Array.isArray(data)) {
+            console.error('[/api/kline] Data is not an array:', data);
+            return json([]);
+        }
 
-        return json(data);
+        const formatted = data.map((k: any[]) => ({
+            time: Math.floor(k[0] / 1000), // Convert ms to seconds (UNIX timestamp)
+            open: parseFloat(k[1]),
+            high: parseFloat(k[2]),
+            low: parseFloat(k[3]),
+            close: parseFloat(k[4]),
+            volume: parseFloat(k[5]),
+        }));
+
+        return json(formatted);
     } catch (err: any) {
         console.error('[/api/kline] Error:', err.message);
         return json({ error: err.message }, { status: 500 });
