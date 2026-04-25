@@ -43,11 +43,16 @@ export const GET: RequestHandler = async ({ url }) => {
                         lastError = e;
                     }
                 }
-                throw lastError || new Error('All Binance endpoints failed');
+                // If we reach here, all failed
+                const errorStatus = (lastError as any)?.response?.status || 500;
+                const errorText = (lastError as any)?.message || 'Unknown error';
+                return { _isError: true, status: errorStatus, message: errorText };
             }
         );
 
-        // Format for Lightweight Charts: { time, open, high, low, close, volume }
+        if ((data as any)._isError) {
+            return json({ error: (data as any).message, status: (data as any).status }, { status: 500 });
+        }
         if (!Array.isArray(data)) {
             console.error('[/api/kline] Data is not an array:', data);
             return json([]);
