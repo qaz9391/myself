@@ -1,7 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { binanceLimiter, cachedFetch, rateLimitedFetch } from '$lib/server/apiCache';
-import { BINANCE_API_KEY } from '$env/static/private';
+import { env } from '$env/dynamic/private';
 
 const BINANCE_BASES = [
     'https://api.binance.com',
@@ -26,10 +26,11 @@ export const GET: RequestHandler = async ({ url }) => {
                 for (const base of BINANCE_BASES) {
                     const apiUrl = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
 
+                    const apiKey = env.BINANCE_API_KEY;
                     // Try with Key first
                     try {
                         const res = await rateLimitedFetch(apiUrl, binanceLimiter, {
-                            headers: BINANCE_API_KEY ? { 'X-MBX-APIKEY': BINANCE_API_KEY } : {}
+                            headers: apiKey ? { 'X-MBX-APIKEY': apiKey } : {}
                         });
                         if (res.ok) return await res.json();
                         
