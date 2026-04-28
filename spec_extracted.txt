@@ -1,0 +1,427 @@
+TradingMonitor
+量化功能升級
+技術規格文件 v1.0
+項目
+說明
+文件版本
+v1.0
+建立日期
+2025-04-26
+用途
+提供程序員明確的邏輯實作規格
+系統名稱
+TradingMonitor / antigravity
+優先順序
+共 5 大模組，依序實作
+一、現有系統問題診斷
+根據截圖分析，目前系統存在以下五個影響判斷品質的問題，依嚴重程度排序：
+優先
+問題
+影響
+嚴重度
+P1
+Anchor Score 全部 100，無差異化
+無法判斷哪個錨點最重要
+🔴 嚴重
+P2
+波動預警缺乏方向性與成交量資訊
+無法判斷橫盤蓄力方向
+🔴 嚴重
+P3
+大戶掛單未整合進錨點系統
+缺少即時主力資金位置
+🟠 中等
+P4
+錨點卡片未顯示距現價百分比
+無法快速判斷進場距離
+🟡 一般
+P5
+板塊輪動與個幣交易候選無橋接
+需人工比對，效率低
+🟡 一般
+二、模組一：Anchor Score 差異化重構
+2.1 問題根因
+目前 Anchor Engine 所有錨點的 Score 均顯示 100，代表評分邏輯沒有對不同品質的錨點做出區分。Score 失去意義，使用者無法從中獲取有效的優先級資訊。
+2.2 新評分公式
+最終分數計算方式
+FinalScore = 時間衰減分(25%) + 突破懲罰分(20%) + 時框共振分(25%) + 成交量確認分(15%) + 觸碰頻率分(15%)
+分數範圍：0 ~ 100，低於 60 分的錨點降格顯示（灰色）
+維度一：時間衰減分（25 分滿分）
+邏輯說明：一個錨點上次被觸碰距今越久，其即時參考性越低，應給予扣分。
+距離上次觸碰
+給分
+7 天以內
+25 分（滿分）
+8 ~ 14 天
+18 分
+15 ~ 30 天
+10 分
+30 天以上
+0 分
+// 程序員實作參考（JavaScript）
+function calcTimeScore(lastTouchTimestamp) {
+  const days = (Date.now() - lastTouchTimestamp) / 86400000;
+  if (days <= 7)  return 25;
+  if (days <= 14) return 18;
+  if (days <= 30) return 10;
+  return 0;
+}
+維度二：突破懲罰分（20 分滿分）
+邏輯說明：一個錨點被突破的次數越多，代表其防守能力越弱，應扣分。
+被突破次數
+給分
+0 次
+20 分（從未被突破）
+1 次
+12 分
+2 次
+5 分
+3 次以上
+0 分
+function calcBreachScore(breachCount) {
+  if (breachCount === 0) return 20;
+  if (breachCount === 1) return 12;
+  if (breachCount === 2) return 5;
+  return 0;
+}
+// 突破判定：
+// 支撐（多）錨點 → 價格有效收盤於錨點下方超過 0.3%
+// 壓力（空）錨點 → 價格有效收盤於錨點上方超過 0.3%
+維度三：時框共振分（25 分滿分）
+邏輯說明：同一個價位在越多時框都被識別為錨點，代表其重要性越高。
+共振時框數量
+給分
+4 個時框（15m+1h+4h+1d）
+25 分
+3 個時框
+18 分
+2 個時框
+10 分
+僅 1 個時框
+3 分
+function calcTimeframeScore(timeframes) {
+  // timeframes 是一個陣列，例如 ["1h", "4h", "1d"]
+  const count = timeframes.length;
+  if (count >= 4) return 25;
+  if (count === 3) return 18;
+  if (count === 2) return 10;
+  return 3;
+}
+維度四：成交量確認分（15 分滿分）
+邏輯說明：錨點被觸碰時，如果成交量明顯放大，代表有真實資金在此交鋒，錨點更可靠。
+觸碰時成交量 vs 20根K棒均量
+給分
+超過均量 2 倍以上
+15 分
+1.5 ~ 2 倍
+10 分
+1.0 ~ 1.5 倍
+5 分
+低於均量
+0 分
+function calcVolumeScore(touchVolume, avgVolume20) {
+  const ratio = touchVolume / avgVolume20;
+  if (ratio >= 2.0) return 15;
+  if (ratio >= 1.5) return 10;
+  if (ratio >= 1.0) return 5;
+  return 0;
+}
+維度五：觸碰頻率分（15 分滿分）
+邏輯說明：過去 30 天內被觸碰次數越多，代表這個價位越受市場重視。
+過去 30 天觸碰次數
+給分
+8 次以上
+15 分
+5 ~ 7 次
+10 分
+3 ~ 4 次
+5 分
+1 ~ 2 次
+2 分
+2.3 分數等級與視覺顯示
+分數範圍
+等級
+卡片顯示方式
+85 ~ 100
+S 級（核心錨點）
+金色邊框 + 置頂顯示
+70 ~ 84
+A 級（強力錨點）
+藍色邊框 + 正常顯示
+55 ~ 69
+B 級（參考錨點）
+灰色邊框 + 縮小顯示
+0 ~ 54
+C 級（弱錨點）
+預設隱藏，需手動展開
+三、模組二：波動預警方向性升級
+3.1 問題根因
+現有波動預警只顯示「N 根 K 棒」的橫盤狀態，缺少三個關鍵資訊：方向性（上升三角還是下降三角）、成交量狀態（是否萎縮）、距關鍵錨點的距離。
+3.2 新增計算邏輯
+邏輯一：橫盤型態識別
+判定規則
+計算過去 N 根 K 棒的最高點序列和最低點序列，分別做線性迴歸
+上升三角：高點持平（斜率 < 0.0005），低點上升（斜率 > 0.001）
+下降三角：低點持平（斜率 > -0.0005），高點下降（斜率 < -0.001）
+對稱三角：高點下降 + 低點上升
+矩形整理：高低點均持平（斜率都在 ±0.0005 之間）
+function identifyPattern(highs, lows) {
+  const highSlope = linearRegression(highs).slope;
+  const lowSlope  = linearRegression(lows).slope;
+  if (Math.abs(highSlope) < 0.0005 && lowSlope > 0.001)
+    return { type: "ascending_triangle", breakDirection: "up" };
+  if (Math.abs(lowSlope) < 0.0005 && highSlope < -0.001)
+    return { type: "descending_triangle", breakDirection: "down" };
+  if (highSlope < -0.001 && lowSlope > 0.001)
+    return { type: "symmetrical_triangle", breakDirection: "neutral" };
+  return { type: "rectangle", breakDirection: "neutral" };
+}
+邏輯二：成交量萎縮判定
+function isVolumeContracted(volumes, windowSize = 10) {
+  const recent = volumes.slice(-windowSize);
+  const baseline = volumes.slice(-windowSize * 3, -windowSize);
+  const recentAvg   = recent.reduce((a,b)=>a+b,0) / recent.length;
+  const baselineAvg = baseline.reduce((a,b)=>a+b,0) / baseline.length;
+  return {
+    contracted: recentAvg < baselineAvg * 0.7,  // 萎縮超過 30%
+    ratio: (recentAvg / baselineAvg * 100).toFixed(1) + "%"
+  };
+}
+邏輯三：距錨點距離計算
+function getAnchorDistance(currentPrice, anchors) {
+  const nearestAbove = anchors
+    .filter(a => a.price > currentPrice)
+    .sort((a,b) => a.price - b.price)[0];
+  const nearestBelow = anchors
+    .filter(a => a.price < currentPrice)
+    .sort((a,b) => b.price - a.price)[0];
+  return {
+    resistance: nearestAbove ? {
+      price: nearestAbove.price,
+      distPct: ((nearestAbove.price - currentPrice)/currentPrice*100).toFixed(2)
+    } : null,
+    support: nearestBelow ? {
+      price: nearestBelow.price,
+      distPct: ((currentPrice - nearestBelow.price)/currentPrice*100).toFixed(2)
+    } : null
+  };
+}
+3.3 新版波動預警卡片顯示格式
+程序員目標：每張預警卡片顯示以下資訊
+幣種名稱 + 時框 + 橫盤 K 棒數
+型態識別：上升三角 ▲ / 下降三角 ▼ / 對稱三角 ◆ / 矩形整理 ■
+成交量狀態：萎縮 62% ✓（綠色）或 放量 ✗（紅色）
+上方最近壓力：+1.2% → $0.251（Score 87）
+下方最近支撐：-2.8% → $0.228（Score 74）
+四、模組三：大戶掛單整合
+4.1 數據來源（免費公開 WebSocket）
+交易所
+WebSocket URL
+訂閱指令
+數據說明
+Binance
+wss://fstream.binance.com/stream
+streams=btcusdt@depth@1000ms
+/btcusdt@aggTrade
+/btcusdt@markPrice@1s
+L2 深度+成交+標記價
+Bybit
+wss://stream.bybit.com/v5/public/linear
+{"op":"subscribe","args":["orderbook.200.BTCUSDT","publicTrade.BTCUSDT","tickers.BTCUSDT"]}
+L2 深度+成交+行情
+OKX
+wss://ws.okx.com:8443/ws/v5/public
+{"op":"subscribe","args":[{"channel":"books","instId":"BTC-USDT-SWAP"},{"channel":"trades","instId":"BTC-USDT-SWAP"}]}
+L2 深度+成交
+Hyperliquid
+wss://api.hyperliquid.xyz/ws
+{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}
+L2 聚合（參考用）
+4.2 過濾邏輯（三道關卡）
+第一關：金額門檻
+幣種
+最低顯示門檻
+BTC
+$3,000,000（300萬美元）
+ETH
+$1,500,000（150萬美元）
+其他主流
+$500,000（50萬美元）
+const THRESHOLDS = {
+  BTCUSDT: 3_000_000,
+  ETHUSDT: 1_500_000,
+  DEFAULT: 500_000
+};
+function passThreshold(symbol, sizeUSD) {
+  const threshold = THRESHOLDS[symbol] || THRESHOLDS.DEFAULT;
+  return sizeUSD >= threshold;
+}
+第二關：持續性驗證（3 分鐘計時）
+// 進入觀察池：第一次看到且金額達標
+// 持續計時：每次收到該價位更新就刷新 lastSeen
+// 升格顯示：firstSeen 距今超過 3 分鐘 → 移入已確認列表
+// 清除：超過 30 秒沒有收到該價位更新 → 視為撤單，移除
+const PERSIST_MS = 3 * 60 * 1000;  // 3 分鐘
+const STALE_MS   = 30 * 1000;       // 30 秒無更新視為消失
+function checkPersistence(order, now) {
+  if (now - order.lastSeen > STALE_MS) return "REMOVED";
+  if (now - order.firstSeen >= PERSIST_MS) return "CONFIRMED";
+  return "PENDING";
+}
+第三關：OKX 合約單位換算（重要！）
+OKX 的掛單量單位是「張數」而非直接的幣數，不換算會導致金額計算錯誤。
+// OKX 各合約每張代表的幣數
+const OKX_CONTRACT_SIZE = {
+  "BTC-USDT-SWAP": 0.01,   // 每張 = 0.01 BTC
+  "ETH-USDT-SWAP": 0.1,    // 每張 = 0.1 ETH
+  "SOL-USDT-SWAP": 1,      // 每張 = 1 SOL
+};
+function convertOKXQty(instId, contracts, markPrice) {
+  const size = OKX_CONTRACT_SIZE[instId] || 1;
+  const coinQty = contracts * size;
+  return coinQty * markPrice;  // 轉換為美元
+}
+4.3 多交易所交叉驗證
+信心等級判定規則
+HIGH（金色）：同一價位（容差 ±$50）在 3 家以上交易所同時出現確認掛單
+MED（藍色）：同一價位在 2 家交易所同時出現確認掛單
+LOW（灰色）：只在單一交易所出現的確認掛單
+const CROSS_PRICE_TOLERANCE = 50;  // $50 價格容差
+function calcCrossExchangeScore(targetOrder, allConfirmed) {
+  const matches = allConfirmed.filter(o =>
+    o.id !== targetOrder.id &&
+    o.side === targetOrder.side &&
+    o.exchange !== targetOrder.exchange &&
+    Math.abs(o.price - targetOrder.price) <= CROSS_PRICE_TOLERANCE
+  );
+  const uniqueExchanges = [...new Set(matches.map(o => o.exchange))];
+  if (uniqueExchanges.length >= 2) return "HIGH";
+  if (uniqueExchanges.length === 1) return "MED";
+  return "LOW";
+}
+4.4 整合到 Anchor 卡片
+當確認掛單的價格落在某個錨點的價格區間內（±0.3%），在該錨點卡片底部新增一行顯示：
+Anchor 卡片底部新增顯示（範例）
+🐋 Binance $4.2M 賣單牆 · 已確認 12分鐘 · 信心 HIGH
+或：🐋 Bybit+OKX $7.1M 買單牆 · 已確認 28分鐘 · 信心 HIGH
+如果該錨點目前沒有大戶掛單，此行不顯示（不要顯示「無掛單」文字）
+五、模組四：Anchor 卡片距現價顯示
+5.1 需要新增的資訊
+每張 Anchor 卡片在 Score 旁邊新增一個「距現價」標籤，讓使用者不需要人工計算距離。
+5.2 計算方式
+function calcDistanceFromPrice(anchorPrice, currentPrice) {
+  const pct = (anchorPrice - currentPrice) / currentPrice * 100;
+  const sign = pct >= 0 ? "+" : "";
+  const direction = pct >= 0 ? "↑ 上方" : "↓ 下方";
+  return {
+    pct: sign + pct.toFixed(2) + "%",
+    direction,
+    isAbove: pct >= 0
+  };
+}
+// 顯示範例：
+// 壓力錨點在上方：↑ +3.24%  （紅色文字）
+// 支撐錨點在下方：↓ -1.87%  （綠色文字）
+// 極近（< 0.5%）：⚡ +0.31% （黃色閃爍，代表即將觸及）
+5.3 極近警示邏輯
+當距現價 < 0.5% 時觸發警示
+卡片邊框變為高亮色（支撐=亮綠，壓力=亮紅）
+距離數字旁顯示閃爍 ⚡ 圖示
+同時在波動預警區塊置頂顯示該幣種
+六、模組五：板塊輪動與個幣候選橋接
+6.1 功能說明
+在「熱門板塊漲幅比較」頁面中，點入某個強勢板塊後，系統自動顯示「該板塊中符合以下條件的交易候選幣種」：
+進入候選清單的條件（三個同時滿足）
+條件 A：該幣種有 Score ≥ 70 的支撐錨點，且距現價 1% ~ 8% 之內
+條件 B：波動預警橫盤 K 棒數 ≥ 20 根（代表已蓄力一段時間）
+條件 C：成交量處於萎縮狀態（近期成交量 < 20根均量的 70%）
+6.2 候選排序邏輯
+function scoreCandidates(candidates) {
+  return candidates.map(c => {
+    let score = 0;
+    // Anchor 品質（最重要）
+    score += c.anchorScore * 0.40;
+    // 橫盤蓄力程度（K棒數越多越好，上限 80根）
+    score += Math.min(c.consolidationBars / 80 * 100, 100) * 0.30;
+    // 距支撐距離（越近越好，最佳 0.5%~3%）
+    const distScore = c.distPct <= 3 ? 100 : Math.max(0, 100 - (c.distPct - 3) * 20);
+    score += distScore * 0.20;
+    // 成交量萎縮程度（萎縮越多越好）
+    score += (1 - c.volumeRatio) * 100 * 0.10;
+    return { ...c, candidateScore: Math.round(score) };
+  }).sort((a, b) => b.candidateScore - a.candidateScore);
+}
+6.3 候選卡片顯示格式
+每個候選幣種顯示以下資訊
+幣種名稱 + 當前價格 + 24H漲跌
+最近支撐：$0.228（-2.3%）Score 82
+橫盤蓄力：45 根 K 棒 ▲ 上升三角
+成交量：萎縮 68%
+候選評分：87 分（由高到低排列）
+七、實作優先順序與時程
+週次
+模組
+主要任務
+預估天數
+第 1 週
+模組一
+Anchor Score 差異化重構
+（5個維度評分 + 等級顯示）
+4 ~ 5 天
+第 1 週
+模組四
+Anchor 卡片新增距現價顯示 + 極近警示
+1 ~ 2 天
+第 2 週
+模組二
+波動預警型態識別 + 方向性 + 成交量
+4 ~ 5 天
+第 2-3 週
+模組三
+大戶掛單 WebSocket 接入 + 過濾 + 整合錨點
+6 ~ 8 天
+第 3-4 週
+模組五
+板塊輪動 → 個幣候選橋接
+4 ~ 6 天
+給程序員的特別注意事項
+1. 模組一的 Score 重算不影響現有 Defend Rate 和 Touch 數據，只是新增評分層
+2. 模組三的 WebSocket 連線需要處理斷線自動重連（建議延遲 5 秒後重試）
+3. OKX 的 WebSocket 需要每 25 秒發送一次 "ping" 心跳保持連線
+4. 大戶掛單的「觀察池」（待確認）與「已確認」要用不同資料結構分開存放
+5. Binance 合約深度訂閱前需先呼叫 REST API 取得初始快照再疊加差分更新
+八、API Endpoint 完整清單
+Binance 合約
+// WebSocket（合併訂閱）
+wss://fstream.binance.com/stream?streams=btcusdt@depth@1000ms/btcusdt@aggTrade/btcusdt@markPrice@1s
+// REST 初始快照（啟動時呼叫一次）
+GET https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000
+// Rate Limit 注意：每分鐘 1200 weight，depth 快照消耗 10 weight
+// 文件：https://binance-docs.github.io/apidocs/futures/en/
+Bybit 合約
+// WebSocket
+wss://stream.bybit.com/v5/public/linear
+// 訂閱指令
+{"op":"subscribe","args":["orderbook.200.BTCUSDT","publicTrade.BTCUSDT","tickers.BTCUSDT"]}
+// REST 快照（每 60 秒補抓一次，避免 WS 漏單）
+GET https://api.bybit.com/v5/market/orderbook?category=linear&symbol=BTCUSDT&limit=500
+OKX 合約
+// WebSocket
+wss://ws.okx.com:8443/ws/v5/public
+// 訂閱指令
+{"op":"subscribe","args":[
+  {"channel":"books","instId":"BTC-USDT-SWAP"},
+  {"channel":"trades","instId":"BTC-USDT-SWAP"},
+  {"channel":"mark-price","instId":"BTC-USDT-SWAP"}
+]}
+// 心跳：每 25 秒發送字串 "ping"（不是 JSON）
+// 文件：https://www.okx.com/docs-v5/en/
+Hyperliquid
+// WebSocket
+wss://api.hyperliquid.xyz/ws
+// 訂閱指令
+{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}
+{"method":"subscribe","subscription":{"type":"allMids"}}
+// 注意：免費版只有 L2 聚合，無法識別單筆大戶，標記為「參考」用途
+// 文件：https://hyperliquid.gitbook.io/hyperliquid-docs/
+文件結束 · TradingMonitor 量化升級規格 v1.0
