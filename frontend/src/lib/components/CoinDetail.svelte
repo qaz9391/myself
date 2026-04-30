@@ -6,9 +6,14 @@
 
     async function loadCoin() {
         loading = true;
+        coin = null; // Clear previous state to prevent stuck data
         try {
             const res = await fetch(`/api/coin?id=${coinId}`);
-            coin = await res.json();
+            if (res.ok) {
+                coin = await res.json();
+            } else {
+                console.warn(`CoinGecko ID not found for ${coinId}`);
+            }
         } catch (e) {
             console.error('Failed to load coin:', e);
         }
@@ -142,10 +147,21 @@
                 <p>{@html coin.description.substring(0, 500)}</p>
             </details>
         {/if}
+    {:else}
+        <div class="empty-state">
+            <span class="empty-icon">😅</span>
+            <span>暫無 <strong>{coinId.toUpperCase()}</strong> 的詳細基本面資料</span>
+            <span style="font-size: 0.7rem; color: rgba(255,255,255,0.3); margin-top: 4px;">(CoinGecko 尚未收錄或 ID 不符)</span>
+        </div>
     {/if}
 </div>
 
 <style>
+    .empty-state {
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        padding: 40px 20px; color: rgba(255,255,255,0.6); text-align: center; gap: 8px;
+    }
+    .empty-icon { font-size: 2rem; margin-bottom: 8px; }
     .coin-detail {
         display: flex;
         flex-direction: column;

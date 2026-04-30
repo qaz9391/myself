@@ -1,5 +1,8 @@
 <script lang="ts">
     import { onMount } from 'svelte';
+    import { AnchorEngine, type Zone } from '$lib/anchorEngine';
+    import { DirectionalEngine } from '$lib/directionalEngine';
+    import { TrapDetector, type PressureZone } from '$lib/trapDetector';
 
     let sectors = $state<any[]>([]);
     let loading = $state(true);
@@ -7,6 +10,18 @@
     let selectedSector = $state<any>(null);
     let sectorCoins = $state<any[]>([]);
     let sectorLoading = $state(false);
+    
+    // Module 5 Candidates
+    let candidates = $state<any[]>([]);
+    let candidatesLoading = $state(false);
+    const engine = new AnchorEngine();
+    
+    let globalWhales: any = {};
+    if (typeof window !== 'undefined') {
+        document.addEventListener('whale_update', (e: any) => {
+            globalWhales[e.detail.symbol] = e.detail.zones;
+        });
+    }
 
     let sortedSectors = $derived(() => {
         const arr = [...sectors];
@@ -30,23 +45,129 @@
         loading = false;
     });
 
+    async function fetchKlines(symbol: string, interval: string) {
+        try {
+            const res = await fetch(`/api/kline?symbol=${symbol}&interval=${interval}&limit=1000`);
+            if (res.ok) return await res.json();
+        } catch {}
+        return [];
+    }
+
     async function selectSector(sector: any) {
         if (selectedSector?.id === sector.id) {
             selectedSector = null;
             sectorCoins = [];
+            candidates = [];
             return;
         }
         selectedSector = sector;
         sectorLoading = true;
+        candidatesLoading = true;
         sectorCoins = [];
+        candidates = [];
+
         try {
             const res = await fetch(`/api/sector-coins?category=${encodeURIComponent(sector.id)}`);
             const data = await res.json();
             sectorCoins = Array.isArray(data) ? data : [];
-        } catch {
+            
+            // --- Module 5: Bridging ---
+            // 1. Fetch Squeeze info
+            const sqzRes = await fetch('/api/squeeze?timeframe=4h');
+            const sqzData = await sqzRes.json();
+            
+            // 2. Pre-filter by Squeeze conditions (>= 20 bars & volume contracted)
+            const preFiltered = sectorCoins.filter(coin => {
+                const sym = (coin.symbol + 'USDT').toUpperCase();
+                const sqz = sqzData.find((s:any) => s.binanceSymbol === sym);
+                if (!sqz) return false;
+                coin.sqz = sqz;
+                return sqz.count >= 20 && sqz.volumeAlert?.contracted;
+            });
+
+            // 3. Lazy evaluate Anchor Engine for survivors
+            const finalCandidates = [];
+            for (const coin of preFiltered) {
+                const sym = (coin.symbol + 'USDT').toUpperCase();
+                const p = coin.current_price;
+                const [k15m, k1h, k4h, k1d] = await Promise.all([
+                    fetchKlines(sym, '15m'), fetchKlines(sym, '1h'), 
+                    fetchKlines(sym, '4h'), fetchKlines(sym, '1d')
+                ]);
+                const zones = engine.processTimeframes({ '15m': k15m, '1h': k1h, '4h': k4h, '1d': k1d }, p);
+                
+                // Conditions: Score >= 70, Support, Distance 1% ~ 8%
+                const qualifyingAnchors = zones.filter(z => {
+                    if (z.top >= p) return false; // Must be support (below price)
+                    if (z.score < 70) return false;
+                    const pct = (p - z.top) / p * 100; // Positive distance
+                    return pct >= 1.0 && pct <= 8.0;
+                });
+                
+                if (qualifyingAnchors.length > 0) {
+                    const bestAnchor = qualifyingAnchors.sort((a,b)=>b.score - a.score)[0];
+                    const distPct = (p - bestAnchor.top) / p * 100;
+                    
+                    // --- NEW: Directional & Trap logic ---
+                    const wzones = globalWhales[sym] || [];
+                    const totalBuy = wzones.filter((z: any) => z.side === 'Buy').reduce((s: number, z: any) => s + (z.totalUsd || 0), 0);
+                    const totalSell = wzones.filter((z: any) => z.side === 'Sell').reduce((s: number, z: any) => s + (z.totalUsd || 0), 0);
+                    const wci = (totalBuy + totalSell > 0) ? (totalBuy - totalSell) / (totalBuy + totalSell) : 0;
+
+                    const bias = DirectionalEngine.calculateBias({
+                        pattern: coin.sqz.pattern,
+                        emaTrend: coin.sqz.emaTrend,
+                        nearestSupport: bestAnchor.top,
+                        nearestResistance: zones.find(z => z.bottom > p)?.bottom || null,
+                        currentPrice: p,
+                        whaleControlIndex: wci,
+                        whaleControlFlow: (totalBuy - totalSell) > 0 ? 1 : -1
+                    });
+
+                    const pressureZones = TrapDetector.findLiquidityPressureZones(p, zones, k1h); // Use 1h for pressure
+
+                    // Score Candidate
+                    const anchorScoreVal = bestAnchor.score * 0.40;
+                    const consolVal = Math.min(coin.sqz.count / 80 * 100, 100) * 0.30;
+                    const distScore = distPct <= 3 ? 100 : Math.max(0, 100 - (distPct - 3) * 20);
+                    const distVal = distScore * 0.20;
+                    const volRatio = coin.sqz.volumeAlert.ratio / 100;
+                    const volVal = (volRatio < 1 ? (1 - volRatio) * 100 : 0) * 0.10;
+                    
+                    coin.candidateScore = Math.round(anchorScoreVal + consolVal + distVal + volVal);
+                    coin.bestAnchor = bestAnchor;
+                    coin.distPct = distPct;
+                    coin.bias = bias;
+                    coin.pressureZones = pressureZones;
+                    coin.wci = wci; // For AI
+                    
+                    // Advice Text (Fallback)
+                    const topPressure = pressureZones.find(pz => pz.type === '上方');
+                    const botPressure = pressureZones.find(pz => pz.type === '下方');
+                    
+                    if (bias.upProb >= 60) {
+                        coin.advice = `多單建議：$${bestAnchor.top.toPrecision(4)} 附近分批掛單`;
+                        if (topPressure) coin.advice += `，目標看向 $${topPressure.price.toPrecision(4)} (${topPressure.reason})`;
+                    } else if (bias.downProb >= 60) {
+                        coin.advice = `空單建議：靠近壓力位尋求賣點`;
+                        if (botPressure) coin.advice += `，先行觀望下方 $${botPressure.price.toPrecision(4)} (${botPressure.reason})`;
+                    } else {
+                        coin.advice = `建議：雙向博弈中，等待蓄力突破 🐋`;
+                    }
+
+                    finalCandidates.push(coin);
+                }
+            }
+            
+            candidates = finalCandidates.sort((a,b) => b.candidateScore - a.candidateScore);
+
+        } catch (e) {
+            console.error(e);
             sectorCoins = [];
+            candidates = [];
         }
         sectorLoading = false;
+        candidatesLoading = false;
     }
 
     function getColor(change: number | null): string {
@@ -127,6 +248,31 @@
             }
         };
     }
+    async function getAIAdvice(coin: any) {
+        if (coin.aiAdvice) return;
+        coin.aiLoading = true;
+        try {
+            const sym = (coin.symbol + 'USDT').toUpperCase();
+            const res = await fetch('/api/ai-advice', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    symbol: sym,
+                    price: coin.current_price,
+                    anchor: coin.bestAnchor,
+                    squeeze: coin.sqz,
+                    wci: coin.wci,
+                    bias: coin.bias
+                })
+            });
+            const data = await res.json();
+            coin.aiAdvice = data.advice;
+        } catch (e) {
+            coin.aiAdvice = 'AI 分析失敗，請檢查網路。';
+        }
+        coin.aiLoading = false;
+        candidates = [...candidates]; // Trigger reactivity
+    }
 </script>
 
 <div class="sector-heatmap" id="sector-heatmap">
@@ -204,6 +350,67 @@
                         <span>暫無該板塊幣種資料</span>
                     </div>
                 {:else}
+                    <!-- Module 5: Candidates Bridging UI -->
+                    {#if candidatesLoading}
+                        <div class="bridge-loading">
+                            <span class="bridge-spinner"></span> 分析技術候選幣種中...
+                        </div>
+                    {:else if candidates.length > 0}
+                        <div class="candidates-container">
+                            <h5 class="section-label" style="color:#fbbf24;">⚡ 交易候選名單 (滿足 3 大條件)</h5>
+                            <div class="candidates-grid">
+                            {#each candidates as c}
+                                <div class="candidate-card">
+                                    <div class="c-head">
+                                        <img src={c.image} alt={c.symbol} class="c-icon" />
+                                        <div class="c-names">
+                                            <span class="c-name">{c.name}</span>
+                                            <span class="c-price">${c.current_price.toPrecision(4)} <span style="color:{c.price_change_percentage_24h>=0?'#00e676':'#ff5252'}">{c.price_change_percentage_24h>=0?'+':''}{c.price_change_percentage_24h.toFixed(2)}%</span></span>
+                                        </div>
+                                        <div class="c-score-badge">{c.candidateScore} 分</div>
+                                    </div>
+                                    <div class="c-stats">
+                                        {#if c.bias}
+                                            <div class="c-stat-row">
+                                                <span style="color:#fff; font-weight:700;">方向預測</span>
+                                                <span style="color: {c.bias.score >= 0 ? '#00e676' : '#ff5252'}">{c.bias.direction} {c.bias.score >=0 ? '上破' : '下破'}機率 {Math.max(c.bias.upProb, c.bias.downProb)}%</span>
+                                            </div>
+                                        {/if}
+                                        <div class="c-stat-row">
+                                            <span>最近支撐</span>
+                                            <span style="color:#00e676">${c.bestAnchor.top.toPrecision(4)} (-{c.distPct.toFixed(2)}%) · Score {c.bestAnchor.score}</span>
+                                        </div>
+                                        <div class="c-stat-row">
+                                            <span>橫盤蓄力</span>
+                                            <span style="color:#fbbf24">{c.sqz.count} 根 K 棒 {c.sqz.pattern?.char} {c.sqz.pattern?.type === 'ascending_triangle' ? '上升三角' : c.sqz.pattern?.type === 'descending_triangle' ? '下降三角' : c.sqz.pattern?.type === 'symmetrical_triangle' ? '對稱收斂' : '收斂中'}</span>
+                                        </div>
+                                        <div class="c-stat-row">
+                                            <span>成交量</span>
+                                            <span style="color:#00e676">萎縮 {c.sqz.volumeAlert?.ratio.toFixed(0)}%</span>
+                                        </div>
+                                        {#if c.aiAdvice}
+                                            <div class="c-ai-box">
+                                                <div class="ai-label">🤖 Claude AI 深度顧問</div>
+                                                <div class="ai-text">{c.aiAdvice}</div>
+                                            </div>
+                                        {:else}
+                                            <button class="ai-btn" onclick={() => getAIAdvice(c)} disabled={c.aiLoading}>
+                                                {c.aiLoading ? 'AI 分析中...' : '✨ 請求 AI 核心分析'}
+                                            </button>
+                                        {/if}
+
+                                        {#if c.advice}
+                                            <div class="c-advice-box">
+                                                {c.advice}
+                                            </div>
+                                        {/if}
+                                    </div>
+                                </div>
+                            {/each}
+                            </div>
+                        </div>
+                    {/if}
+
                     <div class="sector-detail-grid">
                         <!-- Left: Top 3 sparkline charts -->
                         <div class="sparkline-section">
@@ -381,6 +588,42 @@
         padding: 20px;
         animation: panelSlide 0.3s ease;
     }
+    .c-advice-box {
+        margin-top: 8px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        padding: 8px;
+        border-radius: 6px;
+        font-size: 0.72rem;
+        color: #aaa;
+        line-height: 1.4;
+    }
+    .c-ai-box {
+        margin-top: 10px;
+        background: linear-gradient(135deg, rgba(99, 102, 241, 0.2) 0%, rgba(30, 27, 75, 0.4) 100%);
+        border: 1px solid rgba(99, 102, 241, 0.4);
+        padding: 10px;
+        border-radius: 8px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+    }
+    .ai-label { font-size: 0.65rem; color: #a5b4fc; font-weight: 800; text-transform: uppercase; margin-bottom: 4px; letter-spacing: 1px; }
+    .ai-text { font-size: 0.78rem; color: #fff; line-height: 1.5; font-style: italic; }
+    .ai-btn {
+        margin-top: 10px;
+        background: rgba(99, 102, 241, 0.15);
+        border: 1px solid rgba(99, 102, 241, 0.4);
+        color: #a5b4fc;
+        padding: 6px;
+        border-radius: 6px;
+        font-size: 0.72rem;
+        font-weight: 700;
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+    .ai-btn:hover { background: rgba(99, 102, 241, 0.25); border-color: #a5b4fc; }
+    .ai-btn:disabled { opacity: 0.5; cursor: wait; }
+
+    /* Original animation */
     @keyframes panelSlide {
         from { opacity: 0; transform: translateY(-10px); }
         to   { opacity: 1; transform: translateY(0); }
@@ -582,6 +825,22 @@
         0%, 100% { opacity: 0.5; }
         50% { opacity: 1; }
     }
+
+    /* Module 5 Candidates UI */
+    .bridge-loading { font-size: 0.75rem; color: #fbbf24; display: flex; align-items: center; gap: 8px; margin-bottom: 20px; }
+    .bridge-spinner { width: 14px; height: 14px; border: 2px solid rgba(251, 191, 36, 0.2); border-top-color: #fbbf24; border-radius: 50%; animation: spin 0.7s linear infinite; }
+    .candidates-container { margin-bottom: 20px; background: rgba(251, 191, 36, 0.05); padding: 16px; border-radius: 12px; border: 1px solid rgba(251, 191, 36, 0.1); }
+    .candidates-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+    .candidate-card { background: rgba(0,0,0,0.3); border-radius: 10px; padding: 12px; border: 1px solid rgba(255,255,255,0.05); }
+    .c-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 8px; }
+    .c-icon { width: 30px; height: 30px; border-radius: 50%; }
+    .c-names { flex: 1; display: flex; flex-direction: column; }
+    .c-name { font-size: 0.85rem; font-weight: 700; }
+    .c-price { font-size: 0.7rem; color: #aaa; }
+    .c-score-badge { font-size: 0.8rem; font-weight: 800; background: #fbbf24; color: #1e1b4b; padding: 4px 8px; border-radius: 6px; }
+    .c-stats { display: flex; flex-direction: column; gap: 4px; }
+    .c-stat-row { display: flex; justify-content: space-between; font-size: 0.75rem; color: #aaa; }
+    .c-stat-row span:last-child { font-weight: 600; }
 
     @media (max-width: 900px) {
         .sector-detail-grid {

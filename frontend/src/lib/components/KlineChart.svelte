@@ -2,7 +2,17 @@
     import { onMount, onDestroy } from 'svelte';
     import { createChart, type IChartApi, ColorType, type CandlestickData, type Time, CandlestickSeries, HistogramSeries, LineSeries } from 'lightweight-charts';
 
-    let { symbol = 'BTCUSDT', coinName = 'Bitcoin' }: { symbol?: string; coinName?: string } = $props();
+    let { 
+        symbol = 'BTCUSDT', 
+        coinName = 'Bitcoin',
+        anchors = [],
+        whales = []
+    }: { 
+        symbol?: string; 
+        coinName?: string;
+        anchors?: any[];
+        whales?: any[];
+    } = $props();
 
     let chartContainer: HTMLDivElement;
     let chart: IChartApi | null = null;
@@ -13,11 +23,13 @@
     let ema100Series: any = null;
     let ema200Series: any = null;
     let squeezeSeries: any = null;
+    let priceLines: any[] = [];
     let activeInterval = $state('4h');
     let loading = $state(true);
     let error = $state('');
     let showEma = $state(true);
     let showSqueeze = $state(true);
+    let showPoc = $state(true);
 
     const intervals = [
         { label: '1H', value: '1h' },
@@ -190,6 +202,121 @@
         handleResize();
     }
 
+    // ── Visual cleanup: de-duplicate & cap anchor zone rendering ──────────────
+    function deduplicateAnchors(rawAnchors: any[]): any[] {
+        // Sort: S first, then by score desc
+        const sorted = [...rawAnchors].sort((a, b) => {
+            const rankOrder: Record<string, number> = { S: 0, A: 1, B: 2, C: 3 };
+            const ra = rankOrder[a.rank] ?? 3;
+            const rb = rankOrder[b.rank] ?? 3;
+            return ra !== rb ? ra - rb : (b.score - a.score);
+        });
+
+        const kept: any[] = [];
+        const MERGE_PCT = 0.012; // merge zones within 1.2% of each other
+
+        for (const candidate of sorted) {
+            const candidatePoc = candidate.poc || (candidate.top + candidate.bottom) / 2;
+            // Check if this zone is too close to an already-kept zone
+            const isTooClose = kept.some(k => {
+                const kPoc = k.poc || (k.top + k.bottom) / 2;
+                return Math.abs(candidatePoc - kPoc) / kPoc < MERGE_PCT;
+            });
+            if (!isTooClose) kept.push(candidate);
+        }
+
+        // Cap: S/A unlimited, B max 3, C max 2
+        const sA = kept.filter(z => z.rank === 'S' || z.rank === 'A');
+        const b  = kept.filter(z => z.rank === 'B').slice(0, 3);
+        const c  = kept.filter(z => z.rank === 'C').slice(0, 2);
+        return [...sA, ...b, ...c].slice(0, 12); // absolute cap of 12 zones
+    }
+
+    function updateOverlays() {
+        if (!candleSeries) return;
+
+        // Clear existing
+        priceLines.forEach(l => candleSeries.removePriceLine(l));
+        priceLines = [];
+
+        if (!showPoc) return; // If toggled off, exit after clearing
+
+        // Filter valid anchors
+        const displayAnchors = deduplicateAnchors(anchors.filter(a => a.top != null && a.bottom != null && a.type === 'Support'));
+
+        displayAnchors.forEach(a => {
+            const isS = a.rank === 'S';
+            const isA = a.rank === 'A';
+            // S = red-orange, A = amber, B = yellow, C = grey-blue
+            const [r, g, b_] = isS ? [255, 100, 80] : isA ? [255, 160, 40] : a.rank === 'B' ? [250, 204, 60] : [140, 160, 200];
+            const bandOpacity = isS ? 0.25 : isA ? 0.18 : 0.12;
+            const pocOpacity  = isS ? 0.95 : isA ? 0.85 : 0.65;
+
+            const poc = a.poc || (a.top + a.bottom) / 2;
+
+            // Only label the POC line; top/bottom band lines are silent
+            const pocLine = candleSeries.createPriceLine({
+                price: poc,
+                color: `rgba(${r}, ${g}, ${b_}, ${pocOpacity})`,
+                lineWidth: isS ? 2 : 1,
+                lineStyle: 0, // solid
+                axisLabelVisible: true,
+                title: `${isS ? '🔴' : isA ? '🟠' : a.rank === 'B' ? '🟡' : '⚪'} ${a.rank}${a.score ? ` ${a.score}` : ''}`,
+            });
+
+            // Boundary lines (dashed, no label)
+            const topLine = candleSeries.createPriceLine({
+                price: a.top,
+                color: `rgba(${r}, ${g}, ${b_}, ${bandOpacity})`,
+                lineWidth: 1,
+                lineStyle: 1, // dashed
+                axisLabelVisible: false,
+                title: '',
+            });
+            const botLine = candleSeries.createPriceLine({
+                price: a.bottom,
+                color: `rgba(${r}, ${g}, ${b_}, ${bandOpacity})`,
+                lineWidth: 1,
+                lineStyle: 1, // dashed
+                axisLabelVisible: false,
+                title: '',
+            });
+
+            priceLines.push(pocLine, topLine, botLine);
+        });
+
+        // ── 2. Whale Walls: only top 5, iceberg-aware ─────────────────────
+        const topWhales = [...whales]
+            .filter(w => w.type !== 'Trap' || (w.spoofScore || 0) > 70) // show traps only if very high spoof
+            .sort((a, b) => (b.totalUsd || 0) - (a.totalUsd || 0))
+            .slice(0, 5);
+
+        topWhales.forEach(w => {
+            const isBuy    = w.side === 'Buy';
+            const isTrap   = w.type === 'Trap';
+            const ageSec   = (Date.now() - (w.firstSeenMs || Date.now())) / 1000;
+            const opacity  = isTrap ? 0.55 : Math.min(0.9, 0.4 + ageSec / 7200);
+            const usdM     = ((w.totalUsd || 0) / 1_000_000).toFixed(1);
+            const isIceberg = (w.refillCount || 0) >= 3;
+
+            const wallLine = candleSeries.createPriceLine({
+                price: (w.top + w.bottom) / 2,
+                color: isTrap
+                    ? `rgba(255, 200, 0, ${opacity})`
+                    : isBuy
+                        ? `rgba(0, 230, 118, ${opacity})`
+                        : `rgba(255, 82, 82, ${opacity})`,
+                lineWidth: isTrap ? 1 : Math.max(1, Math.min(3, Math.floor((w.totalUsd || 0) / 2_000_000))),
+                lineStyle: isTrap ? 2 : 0,
+                axisLabelVisible: true,
+                title: isTrap
+                    ? `⚠️ TRAP`
+                    : `${isIceberg ? '🧊' : '🐋'} ${isBuy ? 'B' : 'S'} $${usdM}M`,
+            });
+            priceLines.push(wallLine);
+        });
+    }
+
     async function loadData() {
         loading = true;
         error = '';
@@ -257,6 +384,7 @@
                 }
 
                 chart?.timeScale().fitContent();
+                updateOverlays();
             }
         } catch (e: any) {
             error = e.message;
@@ -277,7 +405,15 @@
 
     function toggleSqueeze() {
         showSqueeze = !showSqueeze;
+        if (squeezeSeries) {
+            squeezeSeries.applyOptions({ visible: showSqueeze });
+        }
         loadData();
+    }
+
+    function togglePoc() {
+        showPoc = !showPoc;
+        updateOverlays();
     }
 
     function handleResize() {
@@ -309,6 +445,9 @@
     // Re-load data when symbol changes
     $effect(() => {
         const s = symbol;
+        const a = anchors;
+        const w = whales;
+        
         if (s && chart && prevSymbol && s !== prevSymbol) {
             prevSymbol = s;
             chart.remove();
@@ -320,8 +459,11 @@
             ema100Series = null;
             ema200Series = null;
             squeezeSeries = null;
+            priceLines = [];
             initChart();
             loadData();
+        } else if (chart && candleSeries) {
+            updateOverlays();
         }
     });
 </script>
@@ -342,6 +484,10 @@
                 <button class="ind-btn" class:active={showSqueeze} onclick={toggleSqueeze} title="波動預警 (BB-KC Squeeze)">
                     <span class="ind-dot" style="background: #ff9800"></span>
                     SQZ
+                </button>
+                <button class="ind-btn" class:active={showPoc} onclick={togglePoc} title="實體 POC 區域">
+                    <span class="ind-dot" style="background: rgba(0, 230, 118, 0.8)"></span>
+                    POC
                 </button>
             </div>
             <!-- Interval tabs -->

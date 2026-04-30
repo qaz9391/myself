@@ -28,9 +28,58 @@ async function getTopSymbols(): Promise<string[]> {
                 return true;
             })
             .sort((a: any, b: any) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
-            .slice(0, 50)
+            .slice(0, 100)
             .map((t: any) => t.symbol);
     });
+}
+
+function linearRegression(y: number[]) {
+    const n = y.length;
+    let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+    for (let i = 0; i < n; i++) {
+        sumX += i;
+        sumY += y[i];
+        sumXY += i * y[i];
+        sumXX += i * i;
+    }
+    const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
+    return { slope };
+}
+
+function identifyPattern(highs: number[], lows: number[]) {
+    if (highs.length < 5) return { type: "none", direction: "neutral", char: "" };
+    
+    // Normalize to handle different crypto price scales
+    const h0 = highs[0] || 1;
+    const l0 = lows[0] || 1;
+    const normHighs = highs.map(h => h / h0);
+    const normLows = lows.map(l => l / l0);
+    
+    const hs = linearRegression(normHighs).slope;
+    const ls = linearRegression(normLows).slope;
+
+    if (Math.abs(hs) < 0.0005 && ls > 0.001) return { type: "ascending_triangle", direction: "up", char: "▲" };
+    if (Math.abs(ls) < 0.0005 && hs < -0.001) return { type: "descending_triangle", direction: "down", char: "▼" };
+    if (hs < -0.001 && ls > 0.001) return { type: "symmetrical_triangle", direction: "neutral", char: "◆" };
+    if (Math.abs(hs) <= 0.0005 && Math.abs(ls) <= 0.0005) return { type: "rectangle", direction: "neutral", char: "■" };
+    
+    return { type: "none", direction: "neutral", char: "" };
+}
+
+function isVolumeContracted(volumes: number[], windowSize = 5) {
+    if (volumes.length < windowSize * 3) return { contracted: false, ratioStr: "", ratio: 100 };
+    const recent = volumes.slice(-windowSize);
+    const baseline = volumes.slice(-windowSize * 3, -windowSize);
+    const recentAvg = recent.reduce((a,b)=>a+b,0) / windowSize;
+    const baselineAvg = baseline.reduce((a,b)=>a+b,0) / (windowSize*2) || 1;
+    
+    const contracted = recentAvg < baselineAvg * 0.7;
+    const ratio = (recentAvg / baselineAvg) * 100;
+    return {
+        contracted,
+        ratio,
+        ratioStr: ratio.toFixed(1) + "%"
+    };
 }
 
 function calculateSqueeze(data: number[][]) {
@@ -39,11 +88,12 @@ function calculateSqueeze(data: number[][]) {
     const bbMult = 2.0;
     const kcMult = 1.29;
 
-    if (data.length < sqzLen + 1) return { isSqueeze: false, count: 0 };
+    if (data.length < sqzLen + 1) return { isSqueeze: false, count: 0, price: 0, pattern: { type: "none", direction: "neutral", char: "" }, volumeAlert: { contracted: false, ratioStr: "", ratio: 100 }, emaTrend: "neutral" };
 
     const closes = data.map(d => d[4]); // close
     const highs = data.map(d => d[2]);
     const lows = data.map(d => d[3]);
+    const volumes = data.map(d => d[5]);
 
     // Simple Moving Average
     const sma = (arr: number[], len: number, idx: number) => {
@@ -98,10 +148,47 @@ function calculateSqueeze(data: number[][]) {
         }
     }
 
+    // --- EMA Calculations ---
+    const calcEMA = (period: number) => {
+        if (closes.length < period) return closes[closes.length - 1];
+        let k = 2 / (period + 1);
+        let ema = closes.slice(0, period).reduce((a,b)=>a+b,0) / period; // SMA for first val
+        for (let i = period; i <= lastIdx; i++) {
+            ema = (closes[i] - ema) * k + ema;
+        }
+        return ema;
+    };
+    
+    let emaTrend = "neutral";
+    if (sqzCount >= sqzMinBars || closes.length >= 200) {
+        const ema21 = calcEMA(21);
+        const ema55 = calcEMA(55);
+        const ema200 = calcEMA(200);
+        if (ema21 > ema55 && ema55 > ema200) emaTrend = "bullish";
+        else if (ema21 < ema55 && ema55 < ema200) emaTrend = "bearish";
+    }
+
+    let pattern = { type: "none", direction: "neutral", char: "" };
+    let volumeAlert = { contracted: false, ratioStr: "", ratio: 100 };
+
+    if (sqzCount >= sqzMinBars) {
+        // Look at the bars during the squeeze
+        const lookback = Math.min(sqzCount, 30);
+        const sqzHighs = highs.slice(lastIdx - lookback + 1, lastIdx + 1);
+        const sqzLows = lows.slice(lastIdx - lookback + 1, lastIdx + 1);
+        const sqzVols = volumes.slice(lastIdx - lookback * 2, lastIdx + 1);
+        
+        pattern = identifyPattern(sqzHighs, sqzLows);
+        volumeAlert = isVolumeContracted(sqzVols, Math.max(5, Math.floor(lookback/2)));
+    }
+
     return {
         isSqueeze: sqzCount >= sqzMinBars,
         count: sqzCount,
         price: closes[lastIdx],
+        pattern,
+        volumeAlert,
+        emaTrend
     };
 }
 
@@ -123,7 +210,7 @@ export const GET: RequestHandler = async ({ url }) => {
                 // Optimized: Process all symbols in parallel to avoid Vercel timeout
                 const tasks = symbols.map(async (symbol) => {
                     try {
-                        const apiUrl = `${BINANCE_BASE}/api/v3/klines?symbol=${symbol}&interval=${tf}&limit=100`;
+                        const apiUrl = `${BINANCE_BASE}/api/v3/klines?symbol=${symbol}&interval=${tf}&limit=300`;
                         const res = await rateLimitedFetch(apiUrl, binanceLimiter, {
                             headers: env.BINANCE_API_KEY ? { 'X-MBX-APIKEY': env.BINANCE_API_KEY } : {}
                         });
@@ -140,6 +227,9 @@ export const GET: RequestHandler = async ({ url }) => {
                                     count: squeeze.count,
                                     price: squeeze.price,
                                     timeframe: tf,
+                                    pattern: squeeze.pattern,
+                                    volumeAlert: squeeze.volumeAlert,
+                                    emaTrend: squeeze.emaTrend
                                 };
                             }
                         }
